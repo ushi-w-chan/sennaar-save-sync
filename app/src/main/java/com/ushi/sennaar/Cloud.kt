@@ -5,7 +5,7 @@ import java.net.URL
 import java.time.Instant
 import javax.net.ssl.HttpsURLConnection
 
-internal data class CloudItem(val id: String, val timestamp: Instant, val device: String)
+internal data class CloudItem(val id: String, val timestamp: Instant, val device: String, val slot: String?)
 
 internal class Cloud(endpoint: String, private val token: String) {
     private val base = URL(endpoint.trim().trimEnd('/'))
@@ -28,7 +28,10 @@ internal class Cloud(endpoint: String, private val token: String) {
                 val entry = entries.getJSONObject(index)
                 val id = entry.getString("id")
                 require(SNAPSHOT_ID.matches(id))
-                items += CloudItem(id, Instant.parse(entry.getString("timestamp")), entry.getString("device"))
+                items += CloudItem(
+                    id, Instant.parse(entry.getString("timestamp")), entry.getString("device"),
+                    entry.opt("slot") as? String,
+                )
             }
             cursor = if (page.isNull("cursor")) null else page.getString("cursor")
             check(cursor == null || seen.add(cursor)) { "云端列表分页异常" }

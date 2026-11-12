@@ -15,11 +15,14 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
@@ -56,14 +59,20 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-internal data class LocalItem(val id: String, val timestamp: Instant, val device: String, val rollback: Boolean)
+internal data class LocalItem(
+    val id: String,
+    val timestamp: Instant,
+    val device: String,
+    val slot: String?,
+    val rollback: Boolean,
+)
 
 class SaveModel(app: Application) : AndroidViewModel(app) {
     private val store = File(app.filesDir, "snapshots").apply { mkdirs() }
     private val preferences = app.getSharedPreferences("cloud", 0)
     private val device = "${Build.MANUFACTURER} ${Build.MODEL}"
     private val serviceArgs = Shizuku.UserServiceArgs(ComponentName(app, SaveService::class.java))
-        .daemon(false).processNameSuffix("save").version(1)
+        .daemon(false).processNameSuffix("save").version(2)
     private var service by mutableStateOf<ISaveService?>(null)
     private var binding = false
     var access by mutableStateOf("等待 Shizuku")
@@ -78,6 +87,8 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
     internal var local by mutableStateOf<List<LocalItem>>(emptyList())
         private set
     internal var cloud by mutableStateOf<List<CloudItem>>(emptyList())
+        private set
+    internal var pendingBackupSlots by mutableStateOf<List<String>>(emptyList())
         private set
     internal var pendingRestore by mutableStateOf<LocalItem?>(null)
 
@@ -138,12 +149,28 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         if (binding) runCatching { Shizuku.unbindUserService(serviceArgs, connection, true) }
     }
 
-    fun backup() {
+    fun chooseBackupSlot() {
+        val remote = service ?: return
+        perform("") {
+            val slots = withContext(Dispatchers.IO) { remote.listSlots().toList() }
+            check(slots.isNotEmpty()) { "游戏目录中没有可备份的存档" }
+            pendingBackupSlots = slots
+        }
+    }
+
+    fun dismissBackupSlots() {
+        pendingBackupSlots = emptyList()
+    }
+
+    fun backup(slot: String) {
+        dismissBackupSlots()
         val remote = service ?: return
         perform("本地备份已保存") {
-            val snapshot = withContext(Dispatchers.IO) { Snapshot.decode(remote.capture(device)) }
-            check(snapshot.files.isNotEmpty()) { "游戏目录中没有可备份的存档" }
-            withContext(Dispatchers.IO) { save(snapshot) }
+            withContext(Dispatchers.IO) {
+                val snapshot = Snapshot.decode(remote.capture(device, slot))
+                check(snapshot.files.isNotEmpty()) { "该槽位没有可备份的存档" }
+                save(snapshot)
+            }
             refreshLocal()
         }
     }
@@ -155,7 +182,7 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
             try {
                 withContext(Dispatchers.IO) {
                     val target = load(item.id, item.rollback)
-                    val previous = Snapshot.decode(remote.capture(device))
+                    val previous = Snapshot.decode(remote.capture(device, target.slot))
                     save(previous, rollback = true)
                     remote.restore(target.encode(), previous.fingerprint)
                 }
@@ -216,7 +243,7 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
                 val id = file.nameWithoutExtension.removePrefix("rollback-")
                 if (!SNAPSHOT_ID.matches(id)) return@mapNotNull null
                 runCatching { load(id, rollback) }.getOrNull()?.let {
-                    LocalItem(it.id, it.timestamp, it.device, rollback)
+                    LocalItem(it.id, it.timestamp, it.device, it.slot, rollback)
                 }
             }.sortedByDescending { it.timestamp }
         }
@@ -255,6 +282,8 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
 private val dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     .withZone(ZoneId.systemDefault())
 
+private fun slotLabel(slot: String?) = if (slot == null) "整份存档（旧版）" else "槽位编号 $slot"
+
 @Composable
 private fun SaveScreen(model: SaveModel) {
     LazyColumn(
@@ -270,7 +299,9 @@ private fun SaveScreen(model: SaveModel) {
             Text(model.access)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { model.connect() }, enabled = !model.busy) { Text("连接 Shizuku") }
-                Button(onClick = model::backup, enabled = model.ready && !model.busy) { Text("备份当前存档") }
+                Button(onClick = model::chooseBackupSlot, enabled = model.ready && !model.busy) {
+                    Text("按槽位备份")
+                }
             }
             if (model.busy) Text("处理中…")
             if (model.message.isNotBlank()) Text(model.message)
@@ -283,6 +314,7 @@ private fun SaveScreen(model: SaveModel) {
         items(model.local, key = { "local-${it.id}" }) { item ->
             Column {
                 Text("${dateFormat.format(item.timestamp)} · ${item.device}")
+                Text(slotLabel(item.slot))
                 if (item.rollback) Text("恢复前的回滚快照")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { model.pendingRestore = item }, enabled = model.ready && !model.busy) {
@@ -315,15 +347,33 @@ private fun SaveScreen(model: SaveModel) {
         items(model.cloud, key = { "cloud-${it.id}" }) { item ->
             Column {
                 Text("${dateFormat.format(item.timestamp)} · ${item.device}")
+                Text(slotLabel(item.slot))
                 OutlinedButton(onClick = { model.download(item) }, enabled = !model.busy) { Text("下载到本地") }
             }
         }
     }
+    if (model.pendingBackupSlots.isNotEmpty()) {
+        AlertDialog(
+            onDismissRequest = model::dismissBackupSlots,
+            title = { Text("选择要备份的槽位") },
+            text = {
+                Column(modifier = Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+                    model.pendingBackupSlots.forEach { slot ->
+                        TextButton(onClick = { model.backup(slot) }, enabled = model.ready && !model.busy) {
+                            Text(slotLabel(slot))
+                        }
+                    }
+                }
+            },
+            confirmButton = { TextButton(onClick = model::dismissBackupSlots) { Text("取消") } },
+        )
+    }
     model.pendingRestore?.let { item ->
+        val scope = item.slot?.let { "编号为 $it 的槽位" } ?: "全部槽位"
         AlertDialog(
             onDismissRequest = { model.pendingRestore = null },
             title = { Text("恢复此快照？") },
-            text = { Text("请先退出游戏。恢复会替换游戏当前的存档文件，并在本机保留恢复前的快照。") },
+            text = { Text("请先退出游戏。恢复会替换${scope}的存档文件，并在本机保留恢复前的快照。") },
             confirmButton = { TextButton(onClick = { model.restore(item) }) { Text("恢复") } },
             dismissButton = { TextButton(onClick = { model.pendingRestore = null }) { Text("取消") } },
         )

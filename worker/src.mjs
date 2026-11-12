@@ -1,5 +1,6 @@
 const prefix = "sennaar/v1/";
 const idPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const saveNamePattern = /^(?:journal|places)_([0-9]+)(?:_backup)?\.cos$/;
 const maxBytes = 320 * 1024;
 
 async function authorized(request, env) {
@@ -49,6 +50,7 @@ export default {
           id: key.slice(prefix.length),
           timestamp: uploaded.toISOString(),
           device: customMetadata?.device || "",
+          slot: customMetadata?.slot,
         })),
         cursor: result.truncated ? result.cursor : null,
       }, { headers });
@@ -73,14 +75,26 @@ export default {
       } catch {
         return new Response(null, { status: 400 });
       }
-      if (snapshot?.id !== id || snapshot.version !== 1 ||
+      if (snapshot?.id !== id || (snapshot.version !== 1 && snapshot.version !== 2) ||
           snapshot.package !== "com.playdigious.chantsofsennaar.epic" ||
           typeof snapshot.device !== "string" || !Object.keys(snapshot.files ?? {}).length) {
         return new Response(null, { status: 400 });
       }
+      const customMetadata = { device: snapshot.device.slice(0, 100) };
+      if (snapshot.version === 2) {
+        const { slot, files } = snapshot;
+        if (typeof slot !== "string" || typeof files !== "object" ||
+            !Object.keys(files).every((name) => {
+              const match = saveNamePattern.exec(name);
+              return match?.[0] === name && match[1] === slot;
+            })) {
+          return new Response(null, { status: 400 });
+        }
+        customMetadata.slot = slot;
+      }
       const saved = await env.SAVES.put(key, bytes, {
         onlyIf: new Headers({ "If-None-Match": "*" }),
-        customMetadata: { device: snapshot.device.slice(0, 100) },
+        customMetadata,
       });
       return new Response(null, { status: saved ? 201 : 412 });
     }

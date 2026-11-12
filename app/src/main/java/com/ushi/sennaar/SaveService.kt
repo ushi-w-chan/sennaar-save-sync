@@ -10,9 +10,14 @@ class SaveService : ISaveService.Stub() {
     private val directory = File("/sdcard/Android/data/$GAME/files/Local")
 
     @Synchronized
-    override fun capture(device: String): String {
-        val snapshot = Snapshot.create(device, readFiles())
-        check(snapshot.fingerprint == Snapshot.create(device, readFiles()).fingerprint) {
+    override fun listSlots(): Array<String> = matchingFiles(null)
+        .mapNotNull { saveSlot(it.name) }.distinct()
+        .sortedWith(compareBy<String> { it.length }.thenBy { it }).toTypedArray()
+
+    @Synchronized
+    override fun capture(device: String, slot: String?): String {
+        val snapshot = Snapshot.create(device, slot, readFiles(slot))
+        check(snapshot.fingerprint == Snapshot.create(device, slot, readFiles(slot)).fingerprint) {
             "存档仍在变化，请退出游戏后重试"
         }
         return snapshot.encode()
@@ -22,15 +27,16 @@ class SaveService : ISaveService.Stub() {
     override fun restore(document: String, expectedFingerprint: String) {
         val target = Snapshot.decode(document)
         stopGame()
-        val previous = Snapshot.create("", readFiles())
+        val slot = target.slot
+        val previous = Snapshot.create("", slot, readFiles(slot))
         check(previous.fingerprint == expectedFingerprint) { "存档已变化，请重新发起恢复" }
         try {
-            replaceFiles(target.files)
-            check(Snapshot.create("", readFiles()).fingerprint == target.fingerprint) { "写回校验失败" }
+            replaceFiles(target)
+            check(Snapshot.create("", slot, readFiles(slot)).fingerprint == target.fingerprint) { "写回校验失败" }
         } catch (failure: Exception) {
             try {
-                replaceFiles(previous.files)
-                check(Snapshot.create("", readFiles()).fingerprint == previous.fingerprint)
+                replaceFiles(previous)
+                check(Snapshot.create("", slot, readFiles(slot)).fingerprint == previous.fingerprint)
             } catch (_: Exception) {
                 throw IllegalStateException("恢复和自动回滚均失败，请使用本地回滚快照重试")
             }
@@ -46,13 +52,19 @@ class SaveService : ISaveService.Stub() {
         check(process.waitFor() == 0 && output.isBlank()) { "无法停止游戏" }
     }
 
-    private fun readFiles(): Map<String, ByteArray> {
+    private fun matchingFiles(slot: String?): List<File> {
         if (!directory.exists()) {
             check(directory.parentFile?.list() != null) { "无法访问游戏目录，请确认已安装并启动过 Epic 版" }
-            return emptyMap()
+            return emptyList()
         }
-        val files = checkNotNull(directory.listFiles()) { "无法读取游戏存档目录" }
-            .filter { SAVE_NAME.matches(it.name) }
+        return checkNotNull(directory.listFiles()) { "无法读取游戏存档目录" }.filter { file ->
+            val fileSlot = saveSlot(file.name)
+            fileSlot != null && (slot == null || slot == fileSlot)
+        }
+    }
+
+    private fun readFiles(slot: String?): Map<String, ByteArray> {
+        val files = matchingFiles(slot)
         check(files.size <= 32) { "存档文件过多" }
         var remaining = MAX_BYTES
         return files.associate { file ->
@@ -63,7 +75,8 @@ class SaveService : ISaveService.Stub() {
         }
     }
 
-    private fun replaceFiles(files: Map<String, ByteArray>) {
+    private fun replaceFiles(snapshot: Snapshot) {
+        val files = snapshot.files
         check(directory.isDirectory || directory.mkdir()) { "无法创建存档目录" }
         val staged = mutableMapOf<String, File>()
         try {
@@ -79,9 +92,7 @@ class SaveService : ISaveService.Stub() {
                 Files.move(file.toPath(), File(directory, name).toPath(),
                     StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
             }
-            checkNotNull(directory.listFiles()).filter {
-                SAVE_NAME.matches(it.name) && it.name !in files
-            }.forEach { Files.delete(it.toPath()) }
+            matchingFiles(snapshot.slot).filter { it.name !in files }.forEach { Files.delete(it.toPath()) }
         } finally {
             staged.values.forEach { it.delete() }
         }
