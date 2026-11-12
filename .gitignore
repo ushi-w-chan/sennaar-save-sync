@@ -1,0 +1,8 @@
+.gradle/
+.kotlin/
+.idea/
+local.properties
+**/build/
+worker/.wrangler/
+worker/.dev.vars*
+worker/node_modules/

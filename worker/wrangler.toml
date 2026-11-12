@@ -1,0 +1,7 @@
+name = "sennaar-save-sync"
+main = "src.mjs"
+compatibility_date = "2025-04-01"
+
+[[r2_buckets]]
+binding = "SAVES"
+bucket_name = "sennaar-saves"
