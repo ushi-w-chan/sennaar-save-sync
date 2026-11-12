@@ -263,7 +263,7 @@ private fun SaveScreen(model: SaveModel) {
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         item {
-            Text("圣歌巴别塔存档", style = MaterialTheme.typography.headlineMedium)
+            Text("巴别塔圣歌存档", style = MaterialTheme.typography.headlineMedium)
             Text("Epic 安卓版", style = MaterialTheme.typography.bodyMedium)
         }
         item {

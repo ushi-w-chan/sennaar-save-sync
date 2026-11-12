@@ -1,6 +1,6 @@
-# 圣歌巴别塔存档同步
+# 巴别塔圣歌存档同步
 
-Kotlin / Jetpack Compose 应用，支持 Android 11+ 上的 Epic 安卓版
+Kotlin / Jetpack Compose 应用，支持 Android 11+ 上的《巴别塔圣歌》Epic 安卓版
 `com.playdigious.chantsofsennaar.epic`。
 
 ## 构建与真机测试
