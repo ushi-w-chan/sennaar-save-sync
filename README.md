@@ -24,6 +24,33 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 快照最多包含 32 个文件，原始数据合计最多 192 KiB。
 本地快照存放在应用私有目录，卸载会删除这些本地快照。
 
+## 发布 Android APK
+
+首次发布前，准备一个发布签名密钥库。已有发布密钥时可直接复用，否则可以用 JDK 的 `keytool` 在仓库之外生成。
+
+```sh
+keytool -genkeypair -keystore ~/sennaar-release.jks -storetype JKS \
+  -alias sennaar -keyalg RSA -keysize 2048 -validity 10000
+```
+
+在 GitHub 仓库的 Settings → Secrets and variables → Actions 中添加四个仓库机密。
+
+| 机密 | 值 |
+| --- | --- |
+| `ANDROID_KEYSTORE_BASE64` | 发布签名密钥库的 Base64 内容，可用 `base64 -w 0 ~/sennaar-release.jks` 生成 |
+| `ANDROID_KEYSTORE_PASSWORD` | 密钥库密码 |
+| `ANDROID_KEY_ALIAS` | 签名密钥别名 |
+| `ANDROID_KEY_PASSWORD` | 签名密钥密码 |
+
+将工作流推送到 GitHub 后，在包含工作流的提交上创建并推送版本标签。标签格式为 `v主版本.次版本.修订号`，也可省略 `v`。次版本和修订号各最多三位。
+
+```sh
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+GitHub Actions 从标签设置 APK 的版本名和版本号，构建并验证签名后，将 `sennaar-save-sync-0.2.0.apk` 上传到对应的 GitHub Release。后续发布请继续使用同一签名密钥，以便用户覆盖升级。
+
 ## 部署 Cloudflare Worker
 
 开通 Cloudflare R2 并登录 Wrangler。下面的 Bucket 名称与 `worker/wrangler.toml` 一致，可按需修改两处。

@@ -1,0 +1,101 @@
+name: Publish Android release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+      - '[0-9]*.[0-9]*.[0-9]*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-release-${{ github.ref }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Read version from tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "$version" =~ ^(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})$ ]]; then
+            echo "::error::Use a release tag such as v1.2.3."
+            exit 1
+          fi
+          version_code=$((BASH_REMATCH[1] * 1000000 + BASH_REMATCH[2] * 1000 + BASH_REMATCH[3]))
+          if (( version_code < 1 || version_code > 2100000000 )); then
+            echo "::error::Tag produces a versionCode outside Android's supported release range."
+            exit 1
+          fi
+          {
+            echo "name=$version"
+            echo "code=$version_code"
+            echo "apk=sennaar-save-sync-$version.apk"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Install Android SDK packages
+        run: sdkmanager --install 'platforms;android-36' 'build-tools;36.0.0'
+
+      - name: Build release APK
+        env:
+          VERSION_NAME: ${{ steps.version.outputs.name }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: |
+          ./gradlew --no-daemon :app:assembleRelease \
+            "-PreleaseVersionName=$VERSION_NAME" "-PreleaseVersionCode=$VERSION_CODE"
+
+      - name: Sign and verify APK
+        env:
+          APK_NAME: ${{ steps.version.outputs.apk }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          : "${ANDROID_KEYSTORE_BASE64:?Set the ANDROID_KEYSTORE_BASE64 Actions secret}"
+          : "${ANDROID_KEYSTORE_PASSWORD:?Set the ANDROID_KEYSTORE_PASSWORD Actions secret}"
+          : "${ANDROID_KEY_ALIAS:?Set the ANDROID_KEY_ALIAS Actions secret}"
+          : "${ANDROID_KEY_PASSWORD:?Set the ANDROID_KEY_PASSWORD Actions secret}"
+
+          build_tools="$ANDROID_HOME/build-tools/36.0.0"
+          signing_dir="$(mktemp -d "$RUNNER_TEMP/android-signing.XXXXXX")"
+          trap 'rm -f "$signing_dir/release.keystore" "$signing_dir/aligned.apk"; rmdir "$signing_dir"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$signing_dir/release.keystore"
+          "$build_tools/zipalign" -P 16 -f 4 app/build/outputs/apk/release/app-release-unsigned.apk "$signing_dir/aligned.apk"
+          "$build_tools/apksigner" sign \
+            --ks "$signing_dir/release.keystore" --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD --key-pass env:ANDROID_KEY_PASSWORD \
+            --v4-signing-enabled false \
+            --out "$RUNNER_TEMP/$APK_NAME" "$signing_dir/aligned.apk"
+          "$build_tools/apksigner" verify "$RUNNER_TEMP/$APK_NAME"
+
+      - name: Publish APK to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          APK_NAME: ${{ steps.version.outputs.apk }}
+        run: |
+          if assets="$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name')"; then
+            if ! grep -Fxq -- "$APK_NAME" <<< "$assets"; then
+              gh release upload "$GITHUB_REF_NAME" "$RUNNER_TEMP/$APK_NAME"
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" "$RUNNER_TEMP/$APK_NAME" --verify-tag --generate-notes
+          fi
