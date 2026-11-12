@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.lazy.LazyColumn
@@ -39,6 +38,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -50,7 +50,11 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import rikka.shizuku.Shizuku
@@ -73,16 +77,31 @@ internal data class LocalItem(
     val timestamp: Instant,
     val device: String,
     val slot: String?,
-    val rollback: Boolean,
     val contentHash: String,
+    val progress: List<SaveProgress>,
 )
+
+internal data class CloudDetails(
+    val contentHash: String,
+    val timestamp: Instant,
+    val progress: List<SaveProgress>,
+)
+
+internal data class CurrentSave(val slot: String, val progress: List<SaveProgress>)
+
+internal data class PendingOverwrite(val target: Snapshot, val fingerprint: String)
 
 class SaveModel(app: Application) : AndroidViewModel(app) {
     private val store = File(app.filesDir, "snapshots").apply { mkdirs() }
-    private val preferences = app.getSharedPreferences("cloud", 0)
+    private val cloudDetails = mutableMapOf<CloudItem, CloudDetails>()
+    private val cloudSnapshots = android.util.LruCache<CloudItem, Snapshot>(16)
+    private val cloudReads = mutableMapOf<CloudItem, Deferred<Snapshot>>()
+    private val credentials = SyncCredentials(app.getSharedPreferences("cloud", 0))
     private val device = "${Build.MANUFACTURER} ${Build.MODEL}"
+
+    internal fun isLocalDevice(source: String) = source == device.take(100)
     private val serviceArgs = Shizuku.UserServiceArgs(ComponentName(app, SaveService::class.java))
-        .daemon(false).processNameSuffix("save").version(2)
+        .daemon(false).processNameSuffix("save").version(3)
     private var service by mutableStateOf<ISaveService?>(null)
     private var binding = false
     var access by mutableStateOf("等待 Shizuku")
@@ -94,15 +113,17 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         private set
     internal var messageInCloud by mutableStateOf(false)
         private set
-    var endpoint by mutableStateOf(preferences.getString("endpoint", "").orEmpty())
-    var token by mutableStateOf("")
+    var endpoint by mutableStateOf(credentials.endpoint)
+    var token by mutableStateOf(credentials.readToken())
     internal var local by mutableStateOf<List<LocalItem>>(emptyList())
         private set
     internal var cloud by mutableStateOf<List<CloudItem>>(emptyList())
         private set
     internal var cloudLoaded by mutableStateOf(false)
         private set
-    internal var pendingBackupSlots by mutableStateOf<List<String>>(emptyList())
+    internal var currentSaves by mutableStateOf<List<CurrentSave>?>(null)
+        private set
+    internal var pendingOverwrite by mutableStateOf<PendingOverwrite?>(null)
         private set
     internal var pendingRestore by mutableStateOf<LocalItem?>(null)
     internal var pendingLocalDelete by mutableStateOf<LocalItem?>(null)
@@ -112,9 +133,11 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             service = ISaveService.Stub.asInterface(binder)
             access = "Shizuku 已连接"
+            refreshCurrentSaves()
         }
         override fun onServiceDisconnected(name: ComponentName) {
             service = null
+            currentSaves = null
             binding = false
             access = "存档服务已断开，可重新连接"
         }
@@ -122,6 +145,7 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
     private val received = Shizuku.OnBinderReceivedListener { connect(false) }
     private val died = Shizuku.OnBinderDeadListener {
         service = null
+        currentSaves = null
         binding = false
         access = "请启动 Shizuku"
     }
@@ -134,7 +158,10 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         Shizuku.addBinderReceivedListenerSticky(received)
         Shizuku.addBinderDeadListener(died)
         Shizuku.addRequestPermissionResultListener(permission)
-        perform("") { refreshLocal() }
+        perform("") {
+            refreshLocal()
+            service?.let { readCurrentSaves(it) }
+        }
     }
 
     fun connect(ask: Boolean = true) {
@@ -165,21 +192,22 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         if (binding) runCatching { Shizuku.unbindUserService(serviceArgs, connection, true) }
     }
 
-    fun chooseBackupSlot() {
+    fun refreshCurrentSaves() {
         val remote = service ?: return
-        perform("") {
-            val slots = withContext(Dispatchers.IO) { remote.listSlots().toList() }
-            check(slots.isNotEmpty()) { "游戏目录中没有可备份的存档" }
-            pendingBackupSlots = slots
-        }
+        perform("") { readCurrentSaves(remote) }
     }
 
-    fun dismissBackupSlots() {
-        pendingBackupSlots = emptyList()
+    private suspend fun readCurrentSaves(remote: ISaveService) {
+        val saves = withContext(Dispatchers.IO) {
+            remote.listSlots().mapNotNull { slot ->
+                val snapshot = Snapshot.decode(remote.capture(device, slot))
+                snapshot.takeIf { it.files.isNotEmpty() }?.let { CurrentSave(slot, it.progress()) }
+            }
+        }
+        if (service === remote) currentSaves = saves
     }
 
     fun backup(slot: String) {
-        dismissBackupSlots()
         val remote = service ?: return
         perform("本地备份已保存") {
             withContext(Dispatchers.IO) {
@@ -191,38 +219,71 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    internal fun restore(item: LocalItem, destination: String?) {
+    internal fun prepareRestore(item: LocalItem, destination: String?) {
         pendingRestore = null
         val remote = service ?: return
-        perform("存档已恢复并通过校验，可以打开游戏") {
-            try {
-                withContext(Dispatchers.IO) {
-                    val snapshot = load(item.id, item.rollback)
-                    val target = snapshot.forRestoreSlot(if (item.rollback) snapshot.slot else destination)
-                    val previous = Snapshot.decode(remote.capture(device, target.slot))
-                    save(previous, rollback = true)
-                    remote.restore(target.encode(), previous.fingerprint)
-                }
-            } finally {
-                refreshLocal()
+        perform("") {
+            val (target, previous) = withContext(Dispatchers.IO) {
+                val target = load(item.id).forRestoreSlot(destination)
+                target to Snapshot.decode(remote.capture(device, target.slot))
+            }
+            val overwrite = PendingOverwrite(target, previous.fingerprint)
+            if (previous.files.isEmpty()) {
+                restore(remote, overwrite)
+            } else {
+                pendingOverwrite = overwrite
             }
         }
     }
 
+    fun cancelOverwrite() {
+        pendingOverwrite = null
+    }
+
+    fun confirmOverwrite() {
+        val overwrite = pendingOverwrite ?: return
+        val remote = service ?: return
+        cancelOverwrite()
+        perform("") { restore(remote, overwrite) }
+    }
+
+    private suspend fun restore(remote: ISaveService, overwrite: PendingOverwrite) {
+        withContext(Dispatchers.IO) {
+            remote.restore(overwrite.target.encode(), overwrite.fingerprint)
+        }
+        message = RESTORE_SUCCESS
+        try {
+            readCurrentSaves(remote)
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (failure: Exception) {
+            currentSaves = null
+            message = "$RESTORE_SUCCESS。刷新槽位失败：${failure.message}"
+        }
+    }
+
+    private fun updateCloud(items: List<CloudItem>) {
+        val remaining = items.toSet()
+        cloudDetails.keys.retainAll(remaining)
+        for (item in cloudSnapshots.snapshot().keys - remaining) cloudSnapshots.remove(item)
+        for (item in cloudReads.keys.toSet() - remaining) cloudReads.remove(item)?.cancel()
+        cloud = items
+    }
+
     fun clearCloud() {
-        cloud = emptyList()
+        updateCloud(emptyList())
         cloudLoaded = false
         if (messageInCloud) message = ""
     }
 
     fun refreshCloud() = withCloud("云端列表已刷新") { client ->
-        cloud = withContext(Dispatchers.IO) { client.list() }
+        updateCloud(withContext(Dispatchers.IO) { client.list() })
         cloudLoaded = true
     }
 
     internal fun upload(item: LocalItem) = withCloud("快照已上传，已刷新云端列表", showInCloud = false) { client ->
-        withContext(Dispatchers.IO) { client.upload(load(item.id, item.rollback)) }
-        cloud = withContext(Dispatchers.IO) {
+        val snapshot = withContext(Dispatchers.IO) { load(item.id).also(client::upload) }
+        val items = withContext(Dispatchers.IO) {
             try {
                 client.list()
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -231,15 +292,21 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
                 throw IllegalStateException("快照已上传，但云端列表刷新失败：${failure.message}", failure)
             }
         }
+        val uploaded = checkNotNull(items.find { it.id == item.id }) {
+            "Worker 已接受上传，但云端列表中没有这份快照"
+        }
+        val details = summarizeCloudSnapshot(uploaded, snapshot)
+        updateCloud(items)
+        cloudSnapshots.put(uploaded, snapshot)
+        cloudDetails[uploaded] = details
         cloudLoaded = true
-        check(cloud.any { it.id == item.id }) { "Worker 已接受上传，但云端列表中没有这份快照" }
     }
 
     internal fun deleteLocal(item: LocalItem) {
         pendingLocalDelete = null
         perform("本地快照已删除") {
             withContext(Dispatchers.IO) {
-                val file = snapshotFile(item.id, item.rollback)
+                val file = snapshotFile(item.id)
                 file.delete()
                 check(!file.baseFile.exists()) { "无法删除本地快照" }
             }
@@ -251,27 +318,61 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         pendingCloudDelete = null
         withCloud("云端快照已删除") { client ->
             withContext(Dispatchers.IO) { client.delete(item.id) }
-            cloud = cloud.filterNot { it.id == item.id }
+            updateCloud(cloud.filterNot { it.id == item.id })
         }
     }
 
     internal fun download(item: CloudItem) = withCloud("快照已下载，可从本地列表恢复") { client ->
-        withContext(Dispatchers.IO) { save(client.download(item.id)) }
+        val snapshot = readCloudSnapshot(item, client)
+        withContext(Dispatchers.IO) { save(snapshot) }
         refreshLocal()
     }
 
-    internal suspend fun loadCloudHash(id: String): String {
-        val client = Cloud(endpoint.trim(), token.trim())
-        return withContext(Dispatchers.IO) { client.download(id).contentHash }
+    internal suspend fun loadCloudDetails(item: CloudItem): CloudDetails {
+        cloudDetails[item]?.let { return it }
+        readCloudSnapshot(item, Cloud(endpoint.trim(), token.trim()))
+        return checkNotNull(cloudDetails[item]) { "云端快照列表已变化，请重新读取" }
+    }
+
+    private suspend fun summarizeCloudSnapshot(item: CloudItem, snapshot: Snapshot) =
+        withContext(Dispatchers.IO) {
+            CloudDetails(item.contentHash ?: snapshot.contentHash, snapshot.timestamp, snapshot.progress())
+        }
+
+    private suspend fun readCloudSnapshot(item: CloudItem, client: Cloud): Snapshot {
+        cloudSnapshots.get(item)?.let { return it }
+        val read = cloudReads.getOrPut(item) {
+            viewModelScope.async(start = CoroutineStart.LAZY) {
+                try {
+                    val snapshot = withContext(Dispatchers.IO) { client.download(item.id) }
+                    val details = summarizeCloudSnapshot(item, snapshot)
+                    if (item in cloud) {
+                        cloudSnapshots.put(item, snapshot)
+                        cloudDetails[item] = details
+                    }
+                    snapshot
+                } finally {
+                    if (cloudReads[item] === coroutineContext[Job]) cloudReads.remove(item)
+                }
+            }
+        }
+        return read.await()
     }
 
     private fun withCloud(success: String, showInCloud: Boolean = true, action: suspend (Cloud) -> Unit) {
         val address = endpoint.trim()
         val secret = token.trim()
-        perform(success, showInCloud) {
+        perform("", showInCloud) {
             val client = Cloud(address, secret)
             action(client)
-            preferences.edit().putString("endpoint", address).apply()
+            message = try {
+                withContext(Dispatchers.IO) { credentials.save(address, secret) }
+                success
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                "$success。同步令牌未能保存"
+            }
         }
     }
 
@@ -283,7 +384,7 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             try {
                 action()
-                message = success
+                if (success.isNotEmpty()) message = success
             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
@@ -298,29 +399,27 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         local = withContext(Dispatchers.IO) {
             store.listFiles().orEmpty().mapNotNull { file ->
                 if (file.extension != "json") return@mapNotNull null
-                val rollback = file.name.startsWith("rollback-")
-                val id = file.nameWithoutExtension.removePrefix("rollback-")
+                val id = file.nameWithoutExtension
                 if (!SNAPSHOT_ID.matches(id)) return@mapNotNull null
-                runCatching { load(id, rollback) }.getOrNull()?.let {
-                    LocalItem(it.id, it.timestamp, it.device, it.slot, rollback, it.contentHash)
+                runCatching { load(id) }.getOrNull()?.let {
+                    LocalItem(it.id, it.timestamp, it.device, it.slot, it.contentHash, it.progress())
                 }
             }.sortedByDescending { it.timestamp }
         }
     }
 
-    private fun snapshotFile(id: String, rollback: Boolean): AtomicFile {
+    private fun snapshotFile(id: String): AtomicFile {
         require(SNAPSHOT_ID.matches(id))
-        val name = if (rollback) "rollback-$id" else id
-        return AtomicFile(File(store, "$name.json"))
+        return AtomicFile(File(store, "$id.json"))
     }
 
-    private fun load(id: String, rollback: Boolean) =
-        Snapshot.decode(snapshotFile(id, rollback).readFully().toString(Charsets.UTF_8)).also {
+    private fun load(id: String) =
+        Snapshot.decode(snapshotFile(id).readFully().toString(Charsets.UTF_8)).also {
             check(it.id == id) { "本地快照与所选记录不匹配" }
         }
 
-    private fun save(snapshot: Snapshot, rollback: Boolean = false) {
-        val file = snapshotFile(snapshot.id, rollback)
+    private fun save(snapshot: Snapshot) {
+        val file = snapshotFile(snapshot.id)
         val bytes = snapshot.encode().toByteArray()
         if (file.baseFile.exists()) {
             check(file.readFully().contentEquals(bytes)) { "本地已有不同内容的同名快照" }
@@ -341,6 +440,8 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
 private val dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     .withZone(ZoneId.systemDefault())
 
+private const val RESTORE_SUCCESS = "存档已恢复并通过校验，可以打开游戏"
+
 private val gameSlots = listOf("0", "1", "2")
 
 private fun slotLabel(slot: String?) = when (slot) {
@@ -351,6 +452,8 @@ private fun slotLabel(slot: String?) = when (slot) {
 
 @Composable
 private fun SaveScreen(model: SaveModel) {
+    val local = model.local
+    val localByHash = remember(local) { local.associateBy { it.contentHash } }
     LazyColumn(
         modifier = Modifier.fillMaxWidth().safeDrawingPadding().padding(horizontal = 20.dp),
         contentPadding = androidx.compose.foundation.layout.PaddingValues(top = 24.dp, bottom = 24.dp),
@@ -364,13 +467,35 @@ private fun SaveScreen(model: SaveModel) {
             Text(model.access)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { model.connect() }, enabled = !model.busy) { Text("连接 Shizuku") }
-                Button(onClick = model::chooseBackupSlot, enabled = model.ready && !model.busy) {
-                    Text("按槽位备份")
-                }
             }
             if (!model.messageInCloud) {
                 if (model.busy) Text("处理中…")
                 if (model.message.isNotBlank()) Text(model.message)
+            }
+        }
+        item {
+            HorizontalDivider()
+            Text("当前游戏存档", style = MaterialTheme.typography.titleLarge)
+            OutlinedButton(onClick = model::refreshCurrentSaves, enabled = model.ready && !model.busy) {
+                Text("刷新槽位")
+            }
+            if (!model.ready) Text("连接 Shizuku 后可读取存档")
+        }
+        model.currentSaves?.let { saves ->
+            val bySlot = saves.associateBy { it.slot }
+            items((gameSlots + bySlot.keys).distinct(), key = { "current-$it" }) { slot ->
+                Column {
+                    Text(slotLabel(slot))
+                    val save = bySlot[slot]
+                    if (save == null) {
+                        Text("空槽位", style = MaterialTheme.typography.bodySmall)
+                    } else {
+                        SnapshotProgress(save.progress, slot)
+                        TextButton(onClick = { model.backup(slot) }, enabled = model.ready && !model.busy) {
+                            Text("备份到本地")
+                        }
+                    }
+                }
             }
         }
         item {
@@ -380,18 +505,16 @@ private fun SaveScreen(model: SaveModel) {
         }
         items(model.local, key = { "local-${it.id}" }) { item ->
             Column {
-                Text("${dateFormat.format(item.timestamp)} · ${item.device}")
+                SnapshotSource(item.timestamp, item.device, model.isLocalDevice(item.device))
                 Text(slotLabel(item.slot))
                 SnapshotHash(item.contentHash)
-                if (item.rollback) Text("恢复前的回滚快照")
+                SnapshotProgress(item.progress, item.slot)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { model.pendingRestore = item }, enabled = model.ready && !model.busy) {
                         Text("恢复")
                     }
-                    if (!item.rollback) {
-                        TextButton(onClick = { model.upload(item) }, enabled = !model.busy && model.token.isNotBlank()) {
-                            Text("上传")
-                        }
+                    TextButton(onClick = { model.upload(item) }, enabled = !model.busy && model.token.isNotBlank()) {
+                        Text("上传")
                     }
                     TextButton(onClick = { model.pendingLocalDelete = item }, enabled = !model.busy) {
                         Text("删除")
@@ -424,24 +547,34 @@ private fun SaveScreen(model: SaveModel) {
         }
         items(model.cloud, key = { "cloud-${it.id}" }) { item ->
             Column {
-                Text("${dateFormat.format(item.timestamp)} · ${item.device}")
+                SnapshotSource(item.timestamp, item.device, model.isLocalDevice(item.device))
                 Text(slotLabel(item.slot))
-                if (item.contentHash != null) {
-                    SnapshotHash(item.contentHash)
+                val matchingLocal = item.contentHash?.let(localByHash::get)
+                if (matchingLocal != null) {
+                    SnapshotHash(matchingLocal.contentHash)
+                    SnapshotProgress(matchingLocal.progress, item.slot)
                 } else {
-                    val hash by produceState<String?>(null, item) {
+                    val details by produceState<Result<CloudDetails>?>(null, item) {
+                        value = null
                         value = try {
-                            model.loadCloudHash(item.id)
+                            Result.success(model.loadCloudDetails(item))
                         } catch (cancelled: kotlinx.coroutines.CancellationException) {
                             throw cancelled
-                        } catch (_: Exception) {
-                            ""
+                        } catch (failure: Exception) {
+                            Result.failure(failure)
                         }
                     }
-                    when (val result = hash) {
-                        null -> Text("正在读取 SHA-256…", style = MaterialTheme.typography.bodySmall)
-                        "" -> Text("无法读取 SHA-256", style = MaterialTheme.typography.bodySmall)
-                        else -> SnapshotHash(result)
+                    (item.contentHash ?: details?.getOrNull()?.contentHash)?.let { SnapshotHash(it) }
+                    val result = details
+                    when {
+                        result == null -> Text("正在读取存档进度…", style = MaterialTheme.typography.bodySmall)
+                        result.isFailure -> Text("无法读取快照详情", style = MaterialTheme.typography.bodySmall)
+                        else -> {
+                            val loaded = result.getOrThrow()
+                            Text("快照创建于 ${dateFormat.format(loaded.timestamp)}",
+                                style = MaterialTheme.typography.bodySmall)
+                            SnapshotProgress(loaded.progress, item.slot)
+                        }
                     }
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -453,25 +586,9 @@ private fun SaveScreen(model: SaveModel) {
             }
         }
     }
-    if (model.pendingBackupSlots.isNotEmpty()) {
-        AlertDialog(
-            onDismissRequest = model::dismissBackupSlots,
-            title = { Text("选择要备份的槽位") },
-            text = {
-                Column(modifier = Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
-                    model.pendingBackupSlots.forEach { slot ->
-                        TextButton(onClick = { model.backup(slot) }, enabled = model.ready && !model.busy) {
-                            Text(slotLabel(slot))
-                        }
-                    }
-                }
-            },
-            confirmButton = { TextButton(onClick = model::dismissBackupSlots) { Text("取消") } },
-        )
-    }
     model.pendingRestore?.let { item ->
-        val canChooseSlot = item.slot != null && !item.rollback
-        var destination by rememberSaveable(item.id, item.rollback) {
+        val canChooseSlot = item.slot != null
+        var destination by rememberSaveable(item.id) {
             mutableStateOf(item.slot?.takeIf { !canChooseSlot || it in gameSlots })
         }
         val scope = when {
@@ -506,16 +623,30 @@ private fun SaveScreen(model: SaveModel) {
                             }
                         }
                     }
-                    Text("请先退出游戏。恢复会替换${scope}的存档文件，并在本机保留恢复前的快照。")
+                    Text("请先退出游戏。恢复会替换${scope}的存档文件。")
                 }
             },
             confirmButton = {
                 TextButton(
-                    onClick = { model.restore(item, if (canChooseSlot) destination else item.slot) },
+                    onClick = { model.prepareRestore(item, if (canChooseSlot) destination else item.slot) },
                     enabled = model.ready && !model.busy && (!canChooseSlot || destination != null),
                 ) { Text("恢复") }
             },
             dismissButton = { TextButton(onClick = { model.pendingRestore = null }) { Text("取消") } },
+        )
+    }
+    model.pendingOverwrite?.let { overwrite ->
+        val destination = overwrite.target.slot?.let(::slotLabel) ?: "游戏存档"
+        AlertDialog(
+            onDismissRequest = model::cancelOverwrite,
+            title = { Text("覆盖已有存档？") },
+            text = { Text("${destination}已有存档。继续恢复会覆盖现有进度。") },
+            confirmButton = {
+                TextButton(onClick = model::confirmOverwrite, enabled = model.ready && !model.busy) {
+                    Text("确认覆盖")
+                }
+            },
+            dismissButton = { TextButton(onClick = model::cancelOverwrite) { Text("取消") } },
         )
     }
     model.pendingLocalDelete?.let { item ->
@@ -533,6 +664,31 @@ private fun SaveScreen(model: SaveModel) {
             onDismiss = { model.pendingCloudDelete = null },
             onDelete = { model.deleteCloud(item) },
         )
+    }
+}
+
+@Composable
+private fun SnapshotSource(timestamp: Instant, device: String, isLocal: Boolean) {
+    val localLabel = if (isLocal) " · 本机" else ""
+    Text("${dateFormat.format(timestamp)} · $device$localLabel")
+}
+
+@Composable
+private fun SnapshotProgress(progress: List<SaveProgress>, slot: String?) {
+    val style = MaterialTheme.typography.bodySmall
+    if (progress.isEmpty()) Text("暂无可读取的存档进度", style = style)
+    for (save in progress) {
+        if (slot == null) Text(slotLabel(save.slot), style = style)
+        save.playSeconds?.let { seconds ->
+            Text("游戏时长 ${seconds / 3600} 小时 ${seconds / 60 % 60} 分 ${seconds % 60} 秒", style = style)
+        }
+        save.scene?.let { Text("保存场景 $it", style = style) }
+        save.lastSaved?.let { Text("场景保存于 ${dateFormat.format(it)}", style = style) }
+        save.journalSaved?.let { Text("笔记保存于 ${dateFormat.format(it)}", style = style) }
+        save.glyphs.forEachIndexed { index, glyphs ->
+            Text("语言 ${index + 1} · 已确认 ${glyphs.confirmed}/${glyphs.total} · " +
+                "待确认 ${glyphs.seen - glyphs.confirmed}", style = style)
+        }
     }
 }
 

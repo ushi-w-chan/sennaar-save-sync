@@ -38,7 +38,7 @@ class SaveService : ISaveService.Stub() {
                 replaceFiles(previous)
                 check(Snapshot.create("", slot, readFiles(slot)).fingerprint == previous.fingerprint)
             } catch (_: Exception) {
-                throw IllegalStateException("恢复和自动回滚均失败，请使用本地回滚快照重试")
+                throw IllegalStateException("恢复失败，且无法还原写入前的存档")
             }
             throw IllegalStateException("恢复失败，已回滚：${failure.message}")
         }
