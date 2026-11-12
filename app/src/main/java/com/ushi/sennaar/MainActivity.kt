@@ -21,6 +21,9 @@ import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -29,13 +32,19 @@ import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
@@ -65,6 +74,7 @@ internal data class LocalItem(
     val device: String,
     val slot: String?,
     val rollback: Boolean,
+    val contentHash: String,
 )
 
 class SaveModel(app: Application) : AndroidViewModel(app) {
@@ -82,15 +92,21 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         private set
     var message by mutableStateOf("")
         private set
+    internal var messageInCloud by mutableStateOf(false)
+        private set
     var endpoint by mutableStateOf(preferences.getString("endpoint", "").orEmpty())
     var token by mutableStateOf("")
     internal var local by mutableStateOf<List<LocalItem>>(emptyList())
         private set
     internal var cloud by mutableStateOf<List<CloudItem>>(emptyList())
         private set
+    internal var cloudLoaded by mutableStateOf(false)
+        private set
     internal var pendingBackupSlots by mutableStateOf<List<String>>(emptyList())
         private set
     internal var pendingRestore by mutableStateOf<LocalItem?>(null)
+    internal var pendingLocalDelete by mutableStateOf<LocalItem?>(null)
+    internal var pendingCloudDelete by mutableStateOf<CloudItem?>(null)
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -175,13 +191,14 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    internal fun restore(item: LocalItem) {
+    internal fun restore(item: LocalItem, destination: String?) {
         pendingRestore = null
         val remote = service ?: return
         perform("存档已恢复并通过校验，可以打开游戏") {
             try {
                 withContext(Dispatchers.IO) {
-                    val target = load(item.id, item.rollback)
+                    val snapshot = load(item.id, item.rollback)
+                    val target = snapshot.forRestoreSlot(if (item.rollback) snapshot.slot else destination)
                     val previous = Snapshot.decode(remote.capture(device, target.slot))
                     save(previous, rollback = true)
                     remote.restore(target.encode(), previous.fingerprint)
@@ -192,14 +209,50 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun clearCloud() { cloud = emptyList() }
+    fun clearCloud() {
+        cloud = emptyList()
+        cloudLoaded = false
+        if (messageInCloud) message = ""
+    }
 
     fun refreshCloud() = withCloud("云端列表已刷新") { client ->
         cloud = withContext(Dispatchers.IO) { client.list() }
+        cloudLoaded = true
     }
 
-    internal fun upload(item: LocalItem) = withCloud("快照已上传") { client ->
+    internal fun upload(item: LocalItem) = withCloud("快照已上传，已刷新云端列表", showInCloud = false) { client ->
         withContext(Dispatchers.IO) { client.upload(load(item.id, item.rollback)) }
+        cloud = withContext(Dispatchers.IO) {
+            try {
+                client.list()
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (failure: Exception) {
+                throw IllegalStateException("快照已上传，但云端列表刷新失败：${failure.message}", failure)
+            }
+        }
+        cloudLoaded = true
+        check(cloud.any { it.id == item.id }) { "Worker 已接受上传，但云端列表中没有这份快照" }
+    }
+
+    internal fun deleteLocal(item: LocalItem) {
+        pendingLocalDelete = null
+        perform("本地快照已删除") {
+            withContext(Dispatchers.IO) {
+                val file = snapshotFile(item.id, item.rollback)
+                file.delete()
+                check(!file.baseFile.exists()) { "无法删除本地快照" }
+            }
+            refreshLocal()
+        }
+    }
+
+    internal fun deleteCloud(item: CloudItem) {
+        pendingCloudDelete = null
+        withCloud("云端快照已删除") { client ->
+            withContext(Dispatchers.IO) { client.delete(item.id) }
+            cloud = cloud.filterNot { it.id == item.id }
+        }
     }
 
     internal fun download(item: CloudItem) = withCloud("快照已下载，可从本地列表恢复") { client ->
@@ -207,20 +260,26 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
         refreshLocal()
     }
 
-    private fun withCloud(success: String, action: suspend (Cloud) -> Unit) {
+    internal suspend fun loadCloudHash(id: String): String {
+        val client = Cloud(endpoint.trim(), token.trim())
+        return withContext(Dispatchers.IO) { client.download(id).contentHash }
+    }
+
+    private fun withCloud(success: String, showInCloud: Boolean = true, action: suspend (Cloud) -> Unit) {
         val address = endpoint.trim()
         val secret = token.trim()
-        perform(success) {
+        perform(success, showInCloud) {
             val client = Cloud(address, secret)
             action(client)
             preferences.edit().putString("endpoint", address).apply()
         }
     }
 
-    private fun perform(success: String, action: suspend () -> Unit) {
+    private fun perform(success: String, showInCloud: Boolean = false, action: suspend () -> Unit) {
         if (busy) return
         busy = true
         message = ""
+        messageInCloud = showInCloud
         viewModelScope.launch {
             try {
                 action()
@@ -243,7 +302,7 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
                 val id = file.nameWithoutExtension.removePrefix("rollback-")
                 if (!SNAPSHOT_ID.matches(id)) return@mapNotNull null
                 runCatching { load(id, rollback) }.getOrNull()?.let {
-                    LocalItem(it.id, it.timestamp, it.device, it.slot, rollback)
+                    LocalItem(it.id, it.timestamp, it.device, it.slot, rollback, it.contentHash)
                 }
             }.sortedByDescending { it.timestamp }
         }
@@ -282,7 +341,13 @@ class SaveModel(app: Application) : AndroidViewModel(app) {
 private val dateFormat = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")
     .withZone(ZoneId.systemDefault())
 
-private fun slotLabel(slot: String?) = if (slot == null) "整份存档（旧版）" else "槽位编号 $slot"
+private val gameSlots = listOf("0", "1", "2")
+
+private fun slotLabel(slot: String?) = when (slot) {
+    null -> "整份存档（旧版）"
+    in gameSlots -> "槽位 ${gameSlots.indexOf(slot) + 1}"
+    else -> "槽位编号 $slot"
+}
 
 @Composable
 private fun SaveScreen(model: SaveModel) {
@@ -303,8 +368,10 @@ private fun SaveScreen(model: SaveModel) {
                     Text("按槽位备份")
                 }
             }
-            if (model.busy) Text("处理中…")
-            if (model.message.isNotBlank()) Text(model.message)
+            if (!model.messageInCloud) {
+                if (model.busy) Text("处理中…")
+                if (model.message.isNotBlank()) Text(model.message)
+            }
         }
         item {
             HorizontalDivider()
@@ -315,6 +382,7 @@ private fun SaveScreen(model: SaveModel) {
             Column {
                 Text("${dateFormat.format(item.timestamp)} · ${item.device}")
                 Text(slotLabel(item.slot))
+                SnapshotHash(item.contentHash)
                 if (item.rollback) Text("恢复前的回滚快照")
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = { model.pendingRestore = item }, enabled = model.ready && !model.busy) {
@@ -324,6 +392,9 @@ private fun SaveScreen(model: SaveModel) {
                         TextButton(onClick = { model.upload(item) }, enabled = !model.busy && model.token.isNotBlank()) {
                             Text("上传")
                         }
+                    }
+                    TextButton(onClick = { model.pendingLocalDelete = item }, enabled = !model.busy) {
+                        Text("删除")
                     }
                 }
             }
@@ -343,12 +414,42 @@ private fun SaveScreen(model: SaveModel) {
             Button(onClick = model::refreshCloud, enabled = !model.busy && model.token.isNotBlank()) {
                 Text("刷新云端列表")
             }
+            if (model.messageInCloud) {
+                if (model.busy) Text("处理中…")
+                if (model.message.isNotBlank()) Text(model.message)
+            }
+            if (model.cloudLoaded) {
+                Text(if (model.cloud.isEmpty()) "暂无云端快照" else "${model.cloud.size} 份云端快照")
+            }
         }
         items(model.cloud, key = { "cloud-${it.id}" }) { item ->
             Column {
                 Text("${dateFormat.format(item.timestamp)} · ${item.device}")
                 Text(slotLabel(item.slot))
-                OutlinedButton(onClick = { model.download(item) }, enabled = !model.busy) { Text("下载到本地") }
+                if (item.contentHash != null) {
+                    SnapshotHash(item.contentHash)
+                } else {
+                    val hash by produceState<String?>(null, item) {
+                        value = try {
+                            model.loadCloudHash(item.id)
+                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                            throw cancelled
+                        } catch (_: Exception) {
+                            ""
+                        }
+                    }
+                    when (val result = hash) {
+                        null -> Text("正在读取 SHA-256…", style = MaterialTheme.typography.bodySmall)
+                        "" -> Text("无法读取 SHA-256", style = MaterialTheme.typography.bodySmall)
+                        else -> SnapshotHash(result)
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { model.download(item) }, enabled = !model.busy) { Text("下载到本地") }
+                    TextButton(onClick = { model.pendingCloudDelete = item }, enabled = !model.busy) {
+                        Text("删除")
+                    }
+                }
             }
         }
     }
@@ -369,13 +470,86 @@ private fun SaveScreen(model: SaveModel) {
         )
     }
     model.pendingRestore?.let { item ->
-        val scope = item.slot?.let { "编号为 $it 的槽位" } ?: "全部槽位"
+        val canChooseSlot = item.slot != null && !item.rollback
+        var destination by rememberSaveable(item.id, item.rollback) {
+            mutableStateOf(item.slot?.takeIf { !canChooseSlot || it in gameSlots })
+        }
+        val scope = when {
+            item.slot == null -> "全部槽位"
+            destination != null -> slotLabel(destination)
+            else -> "目标槽位"
+        }
         AlertDialog(
             onDismissRequest = { model.pendingRestore = null },
             title = { Text("恢复此快照？") },
-            text = { Text("请先退出游戏。恢复会替换${scope}的存档文件，并在本机保留恢复前的快照。") },
-            confirmButton = { TextButton(onClick = { model.restore(item) }) { Text("恢复") } },
+            text = {
+                Column(
+                    modifier = Modifier.verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    if (canChooseSlot) {
+                        Text("目标槽位（备份来自${slotLabel(item.slot)}）")
+                        Column(Modifier.selectableGroup()) {
+                            gameSlots.forEach { slot ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().selectable(
+                                        selected = destination == slot,
+                                        onClick = { destination = slot },
+                                        role = Role.RadioButton,
+                                    ).padding(vertical = 12.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                                ) {
+                                    RadioButton(selected = destination == slot, onClick = null)
+                                    Text(slotLabel(slot))
+                                }
+                            }
+                        }
+                    }
+                    Text("请先退出游戏。恢复会替换${scope}的存档文件，并在本机保留恢复前的快照。")
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { model.restore(item, if (canChooseSlot) destination else item.slot) },
+                    enabled = model.ready && !model.busy && (!canChooseSlot || destination != null),
+                ) { Text("恢复") }
+            },
             dismissButton = { TextButton(onClick = { model.pendingRestore = null }) { Text("取消") } },
         )
     }
+    model.pendingLocalDelete?.let { item ->
+        DeleteSnapshotDialog(
+            title = "删除本地快照？",
+            details = "${slotLabel(item.slot)} · ${dateFormat.format(item.timestamp)}\n仅删除此 App 中保存的副本。",
+            onDismiss = { model.pendingLocalDelete = null },
+            onDelete = { model.deleteLocal(item) },
+        )
+    }
+    model.pendingCloudDelete?.let { item ->
+        DeleteSnapshotDialog(
+            title = "删除云端快照？",
+            details = "${slotLabel(item.slot)} · ${dateFormat.format(item.timestamp)}\n删除后，其他设备也无法再下载此快照。",
+            onDismiss = { model.pendingCloudDelete = null },
+            onDelete = { model.deleteCloud(item) },
+        )
+    }
+}
+
+@Composable
+private fun SnapshotHash(hash: String) {
+    SelectionContainer {
+        Text("SHA-256\n$hash", fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun DeleteSnapshotDialog(title: String, details: String, onDismiss: () -> Unit, onDelete: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(title) },
+        text = { Text(details) },
+        confirmButton = { TextButton(onClick = onDelete) { Text("删除") } },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }

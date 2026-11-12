@@ -1,7 +1,35 @@
 const prefix = "sennaar/v1/";
 const idPattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const saveNamePattern = /^(?:journal|places)_([0-9]+)(?:_backup)?\.cos$/;
+const sha256Pattern = /^[0-9a-f]{64}$/;
 const maxBytes = 320 * 1024;
+
+async function contentHash(files) {
+  const names = Object.keys(files).sort();
+  if (names.length > 32) return undefined;
+  const entries = [];
+  for (const name of names) {
+    const entry = files[name];
+    if (saveNamePattern.exec(name)?.[0] !== name || typeof entry?.sha256 !== "string" ||
+        !sha256Pattern.test(entry.sha256) || typeof entry.data !== "string") return undefined;
+    let decoded;
+    try {
+      decoded = atob(entry.data);
+    } catch {
+      return undefined;
+    }
+    const bytes = new Uint8Array(decoded.length);
+    for (let index = 0; index < decoded.length; index++) bytes[index] = decoded.charCodeAt(index);
+    if (await sha256(bytes) !== entry.sha256) return undefined;
+    entries.push(`${name}:${entry.sha256}`);
+  }
+  return sha256(new TextEncoder().encode(entries.join("\n")));
+}
+
+async function sha256(bytes) {
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
 
 async function authorized(request, env) {
   const header = request.headers.get("Authorization");
@@ -51,6 +79,7 @@ export default {
           timestamp: uploaded.toISOString(),
           device: customMetadata?.device || "",
           slot: customMetadata?.slot,
+          contentHash: customMetadata?.contentHash,
         })),
         cursor: result.truncated ? result.cursor : null,
       }, { headers });
@@ -60,6 +89,10 @@ export default {
       return new Response(null, { status: 404 });
     }
     const key = prefix + id;
+    if (request.method === "DELETE") {
+      await env.SAVES.delete(key);
+      return new Response(null, { status: 204, headers });
+    }
     if (request.method === "GET") {
       const object = await env.SAVES.get(key);
       return object
@@ -92,6 +125,8 @@ export default {
         }
         customMetadata.slot = slot;
       }
+      const hash = await contentHash(snapshot.files);
+      if (hash) customMetadata.contentHash = hash;
       const saved = await env.SAVES.put(key, bytes, {
         onlyIf: new Headers({ "If-None-Match": "*" }),
         customMetadata,

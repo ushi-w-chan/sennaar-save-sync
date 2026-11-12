@@ -25,10 +25,24 @@ internal data class Snapshot(
     val slot: String?,
     val files: Map<String, ByteArray>,
 ) {
+    fun forRestoreSlot(destination: String?): Snapshot {
+        if (destination == slot) return this
+        require(slot != null && destination != null && SLOT_ID.matches(destination)) { "无效的目标槽位编号" }
+        val renamed = files.entries.associate { (name, bytes) ->
+            val match = requireNotNull(SAVE_NAME.matchEntire(name))
+            val slotRange = requireNotNull(match.groups[1]).range
+            name.replaceRange(slotRange, destination) to bytes
+        }
+        return copy(slot = destination, files = renamed)
+    }
+
     val fingerprint: String
         get() = files.toSortedMap().entries.joinToString("\n") { (name, bytes) ->
             "$name:${sha256(bytes)}"
         }
+
+    val contentHash: String
+        get() = sha256(fingerprint.toByteArray(Charsets.UTF_8))
 
     fun encode(): String {
         val entries = JSONObject()
